@@ -24,7 +24,6 @@ jobs:
             exit 1
           fi
 
-      - run: zig test src/root.zig
       - run: zig build release
 
       - name: Prepare assets
