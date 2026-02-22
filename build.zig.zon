@@ -7,6 +7,7 @@
         .clap = .{
             .url = "git+https://github.com/Hejsil/zig-clap#27621cb7207643f914bae7b01902b22a8b5916e7",
             .hash = "clap-0.11.0-oBajBxDoAQChQCl4LRM4tyf-VChKLbhYilS806xxzxrQ",
+            .lazy = true,
         },
     },
     .paths = .{
