@@ -12,19 +12,17 @@ env:
 
 jobs:
   release:
-    runs-on: ubuntu-22.04
-    container:
-      image: debian:bookworm-slim
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: apt-get update && apt-get install -y curl xz-utils git
 
       - name: Install Zig
         run: |
           curl -L "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar xJ
           echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Disable io_uring (workaround for Zig 0.16 hang)
+        run: sudo sysctl -w kernel.io_uring_disabled=2 || true
 
       - name: Validate version matches tag
         if: startsWith(github.ref, 'refs/tags/v')
