@@ -13,8 +13,13 @@ env:
 jobs:
   release:
     runs-on: ubuntu-22.04
+    container:
+      image: debian:bookworm-slim
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y curl xz-utils git
 
       - name: Install Zig
         run: |
