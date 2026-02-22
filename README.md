@@ -39,6 +39,20 @@ cp completions/ev.zsh ~/.local/share/zsh/site-functions/_ev
 cp completions/ev.fish ~/.config/fish/completions/ev.fish
 ```
 
+## Screenshots
+
+### Scan
+<img src=".screenshots/ev-scan-category-system.png" alt="ev scan" width="600">
+
+### Clean (interactive)
+<img src=".screenshots/ev-clean-category-system.png" alt="ev clean" width="600">
+
+### Analyze
+<img src=".screenshots/ev-analyze.png" alt="ev analyze" width="600">
+
+### Status
+<img src=".screenshots/ev-status.png" alt="ev status" width="600">
+
 ## Usage
 
 ### Scan for reclaimable space
