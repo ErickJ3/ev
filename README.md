@@ -6,6 +6,14 @@ A filesystem cleaner and disk space analyzer for Linux and FreeBSD.
 
 ## Install
 
+### Quick install
+
+```
+curl -fsSL https://raw.githubusercontent.com/ErickJ3/ev/main/install.sh | bash
+```
+
+Downloads the latest binary for your platform to `~/.local/bin`.
+
 ### Build from source
 
 Requires [Zig](https://ziglang.org/) 0.16+.
