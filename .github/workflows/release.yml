@@ -1,0 +1,45 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+
+      - name: Validate version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          ZON_VERSION=$(grep '\.version' build.zig.zon | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$ZON_VERSION" ]; then
+            echo "ERROR: Tag ($TAG_VERSION) != build.zig.zon ($ZON_VERSION)"
+            exit 1
+          fi
+
+      - run: zig build test
+      - run: zig build release
+
+      - name: Prepare assets
+        run: |
+          mkdir -p dist
+          cp zig-out/release/x86_64-linux/ev dist/ev-linux-x86_64
+          cp zig-out/release/aarch64-linux/ev dist/ev-linux-aarch64
+          cp zig-out/release/x86_64-freebsd/ev dist/ev-freebsd-x86_64
+          cd dist && sha256sum ev-* > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/ev-linux-x86_64
+            dist/ev-linux-aarch64
+            dist/ev-freebsd-x86_64
+            dist/checksums.txt
