@@ -2,7 +2,7 @@
 
 A filesystem cleaner and disk space analyzer for Linux and FreeBSD.
 
-`ev` scans your system for reclaimable space in build artifacts, package caches, a.i model caches, browser data, and more. Then lets you clean them up interactively or in bulk.
+`ev` scans your system for reclaimable space: build artifacts, package caches, AI model caches, browser data. Then lets you clean up interactively or in bulk.
 
 ## Install
 
@@ -83,7 +83,7 @@ ev purge ~/projects --depth 5
 ev purge ~/projects --dry-run
 ```
 
-Walks a directory tree, finds projects (by marker files like `package.json`, `Cargo.toml`, etc.), and cleans their build outputs.
+Walks a directory tree, finds projects by marker files (`package.json`, `Cargo.toml`, etc.), and cleans their build outputs.
 
 ### Analyze disk usage
 
@@ -117,7 +117,7 @@ ev config whitelist ~/important-project
 
 ## Configuration
 
-**Whitelist** — paths that `ev` will never touch:
+Whitelist — paths `ev` will never touch:
 
 ```
 ~/.config/evi/whitelist
@@ -125,7 +125,7 @@ ev config whitelist ~/important-project
 
 One path per line. Lines starting with `#` are comments.
 
-**Operation log** — records every deletion with timestamps:
+Operation log — records every deletion with timestamps:
 
 ```
 ~/.local/share/evi/operations.log
