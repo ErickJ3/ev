@@ -4,6 +4,7 @@ const Dir = Io.Dir;
 const rules_mod = @import("rules.zig");
 const platform = @import("platform.zig");
 const ui = @import("ui.zig");
+const progress = @import("progress.zig");
 const Rule = rules_mod.Rule;
 const Category = rules_mod.Category;
 const Allocator = std.mem.Allocator;
@@ -24,7 +25,7 @@ pub const ScanOptions = struct {
 pub const ResultList = std.ArrayList(ScanResult);
 
 /// Pre-built lookup tables for O(1) rule matching by entry name.
-const RuleLookup = struct {
+pub const RuleLookup = struct {
     dir_names: std.StringHashMapUnmanaged(*const Rule),
     marker_files: std.StringHashMapUnmanaged(*const Rule),
 
@@ -46,7 +47,7 @@ const RuleLookup = struct {
         return .{ .dir_names = dir_names, .marker_files = marker_files };
     }
 
-    fn initFromRules(allocator: Allocator, selected_rules: []const Rule) !RuleLookup {
+    pub fn initFromRules(allocator: Allocator, selected_rules: []const Rule) !RuleLookup {
         var dir_names: std.StringHashMapUnmanaged(*const Rule) = .empty;
         var marker_files: std.StringHashMapUnmanaged(*const Rule) = .empty;
 
@@ -71,6 +72,14 @@ pub fn scan(allocator: Allocator, io: Io, root_path: []const u8, options: ScanOp
     var results: ResultList = .empty;
     errdefer results.deinit(allocator);
 
+    var tracker: progress.Tracker = .{};
+    var ticker: ?progress.Ticker = null;
+    if (options.progress_writer) |pw| {
+        ticker = progress.Ticker.init(io, pw, &tracker, "Scanning", "dirs");
+        ticker.?.begin();
+    }
+    defer if (ticker) |*t| t.end();
+
     const home = options.home;
     const selected_rules = if (options.category) |cat|
         rules_mod.rulesForCategory(cat)
@@ -81,8 +90,10 @@ pub fn scan(allocator: Allocator, io: Io, root_path: []const u8, options: ScanOp
         switch (rule.detection) {
             .path_prefix => |prefix| {
                 const expanded = try expandTilde(allocator, prefix, home);
-                const size = dirSize(io, expanded) catch continue;
+                tracker.setPath(0, expanded);
+                const size = dirSizeTracked(io, expanded, &tracker) catch continue;
                 if (size > 0) {
+                    tracker.addItem(size);
                     try results.append(allocator, .{
                         .path = expanded,
                         .size = size,
@@ -98,17 +109,13 @@ pub fn scan(allocator: Allocator, io: Io, root_path: []const u8, options: ScanOp
     const n_cpus = std.Thread.getCpuCount() catch 1;
 
     if (n_cpus > 1) {
-        parallelWalkDir(allocator, io, root_path, &lookup, &results, options.max_depth, options.progress_writer) catch {
-            var dir_count: usize = 0;
-            try walkDir(allocator, io, root_path, &lookup, &results, 0, options.max_depth, options.progress_writer, &dir_count);
+        const prefix_count = results.items.len;
+        parallelWalkDir(allocator, io, root_path, &lookup, &results, options.max_depth, &tracker) catch {
+            results.shrinkRetainingCapacity(prefix_count);
+            try walkDir(allocator, io, root_path, &lookup, &results, 0, options.max_depth, &tracker);
         };
     } else {
-        var dir_count: usize = 0;
-        try walkDir(allocator, io, root_path, &lookup, &results, 0, options.max_depth, options.progress_writer, &dir_count);
-    }
-
-    if (options.progress_writer) |pw| {
-        ui.clearProgress(pw) catch {};
+        try walkDir(allocator, io, root_path, &lookup, &results, 0, options.max_depth, &tracker);
     }
 
     std.mem.sort(ScanResult, results.items, {}, struct {
@@ -128,20 +135,17 @@ fn walkDir(
     results: *ResultList,
     depth: u32,
     max_depth: u32,
-    progress_writer: ?*Io.Writer,
-    dir_count: *usize,
+    tracker: ?*progress.Tracker,
 ) !void {
     if (depth >= max_depth) return;
     if (platform.impl.isSkipDir(path)) return;
 
-    dir_count.* += 1;
-    if (progress_writer) |pw| {
-        if (dir_count.* % 10 == 0) {
-            ui.printProgress(pw, dir_count.*, path) catch {};
-        }
-    }
+    if (tracker) |t| t.addDir(0, path);
 
-    var dir = Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return;
+    var dir = Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch {
+        if (tracker) |t| t.addDenied();
+        return;
+    };
     defer dir.close(io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -154,8 +158,10 @@ fn walkDir(
         if (entry.kind == .directory) {
             if (lookup.dir_names.get(entry.name)) |rule| {
                 const full_path = try std.fs.path.join(allocator, &.{ path, entry.name });
-                const size = dirSize(io, full_path) catch 0;
+                if (tracker) |t| t.setPath(0, full_path);
+                const size = dirSizeTracked(io, full_path, tracker) catch 0;
                 if (size > 0) {
+                    if (tracker) |t| t.addItem(size);
                     try results.append(allocator, .{
                         .path = full_path,
                         .size = size,
@@ -175,8 +181,7 @@ fn walkDir(
                 @memcpy(path_buf[0..path_len], path);
                 path_buf[path_len] = '/';
                 @memcpy(path_buf[path_len + 1 ..][0..name_len], entry.name);
-                const sub_path = try allocator.dupe(u8, path_buf[0..total_len]);
-                try walkDir(allocator, io, sub_path, lookup, results, depth + 1, max_depth, progress_writer, dir_count);
+                try walkDir(allocator, io, path_buf[0..total_len], lookup, results, depth + 1, max_depth, tracker);
             }
         }
 
@@ -185,8 +190,9 @@ fn walkDir(
                 const mf = rule.detection.marker_file;
                 for (mf.targets) |target_name| {
                     const target_path = try std.fs.path.join(allocator, &.{ path, target_name });
-                    const size = dirSize(io, target_path) catch continue;
+                    const size = dirSizeTracked(io, target_path, tracker) catch continue;
                     if (size > 0) {
+                        if (tracker) |t| t.addItem(size);
                         try results.append(allocator, .{
                             .path = target_path,
                             .size = size,
@@ -199,27 +205,63 @@ fn walkDir(
     }
 }
 
+/// A directory queued for scanning. `path` is owned by the queue arena.
+const Task = struct {
+    path: []const u8,
+    depth: u32,
+};
+
 /// Shared state for parallel directory scanning.
-/// Workers steal toplevel subdirectories via atomic index, then walk sequentially.
+/// Workers drain a shared LIFO stack of directory tasks; while the stack is
+/// hungry (below `hungry` entries) they hand subdirectories back to it instead
+/// of recursing, so one giant subtree cannot pin a single worker while the
+/// rest idle. Lock traffic is rare after warmup: the racy `pending_len`
+/// pre-check keeps the hot path lock-free, and workers never touch shared
+/// allocators or result lists (each has its own WorkerCtx).
 const SharedScanState = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    allocator: Allocator,
-    results: *ResultList,
     lookup: *const RuleLookup,
     io: Io,
     max_depth: u32,
-    children: []const []const u8,
-    next_idx: std.atomic.Value(usize) = .init(0),
-    dir_count: std.atomic.Value(usize) = .init(0),
+    tracker: ?*progress.Tracker = null,
 
-    fn lock(self: *SharedScanState) void {
-        while (!self.mutex.tryLock()) {
-            std.atomic.spinLoopHint();
-        }
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    /// Guarded by `mutex`; storage and task paths live in `queue_alloc`.
+    pending: std.ArrayList(Task) = .empty,
+    queue_alloc: Allocator,
+    /// Workers currently processing a task. Guarded by `mutex`.
+    active: usize = 0,
+    /// Mirror of `pending.items.len` for the lock-free pre-check.
+    pending_len: std.atomic.Value(usize) = .init(0),
+    /// Push subdirectories as tasks while the queue holds fewer than this.
+    hungry: usize,
+
+    /// Hand a directory to the queue if it is hungry. Returns false when the
+    /// queue is full enough (or on allocation failure): caller walks inline.
+    fn tryPush(state: *SharedScanState, path: []const u8, depth: u32) bool {
+        if (state.pending_len.load(.monotonic) >= state.hungry) return false;
+
+        const io = state.io;
+        state.mutex.lockUncancelable(io);
+        defer state.mutex.unlock(io);
+
+        if (state.pending.items.len >= state.hungry) return false;
+        const path_copy = state.queue_alloc.dupe(u8, path) catch return false;
+        state.pending.append(state.queue_alloc, .{ .path = path_copy, .depth = depth }) catch return false;
+        state.pending_len.store(state.pending.items.len, .monotonic);
+        state.cond.signal(io);
+        return true;
     }
+};
 
-    fn unlock(self: *SharedScanState) void {
-        self.mutex.unlock();
+/// Per-worker allocation context: results land in the worker's own arena
+/// with zero cross-thread synchronization, merged by the main thread after join.
+const WorkerCtx = struct {
+    arena: std.heap.ArenaAllocator,
+    results: ResultList = .empty,
+
+    fn init() WorkerCtx {
+        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 };
 
@@ -230,129 +272,111 @@ fn parallelWalkDir(
     lookup: *const RuleLookup,
     results: *ResultList,
     max_depth: u32,
-    progress_writer: ?*Io.Writer,
+    tracker: ?*progress.Tracker,
 ) !void {
     if (platform.impl.isSkipDir(root_path)) return;
     if (max_depth == 0) return;
 
-    var children: std.ArrayList([]const u8) = .empty;
-
-    {
-        var dir = Dir.openDirAbsolute(io, root_path, .{ .iterate = true }) catch return;
-        defer dir.close(io);
-
-        var iter = dir.iterate();
-        while (iter.next(io) catch null) |entry| {
-            if (entry.kind == .sym_link) continue;
-
-            if (entry.kind == .directory) {
-                if (lookup.dir_names.get(entry.name)) |rule| {
-                    const full_path = try std.fs.path.join(allocator, &.{ root_path, entry.name });
-                    const size = dirSize(io, full_path) catch 0;
-                    if (size > 0) {
-                        try results.append(allocator, .{ .path = full_path, .size = size, .rule = rule });
-                    }
-                    continue;
-                }
-
-                if (entry.name.len > 0 and entry.name[0] == '.') {
-                    if (!isInterestingHiddenDir(entry.name)) continue;
-                }
-
-                const child_path = try std.fs.path.join(allocator, &.{ root_path, entry.name });
-                try children.append(allocator, child_path);
-            }
-
-            if (entry.kind == .file) {
-                if (lookup.marker_files.get(entry.name)) |rule| {
-                    const mf = rule.detection.marker_file;
-                    for (mf.targets) |target_name| {
-                        const target_path = try std.fs.path.join(allocator, &.{ root_path, target_name });
-                        const size = dirSize(io, target_path) catch continue;
-                        if (size > 0) {
-                            try results.append(allocator, .{ .path = target_path, .size = size, .rule = rule });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (children.items.len == 0) return;
-
     const n_cpus = std.Thread.getCpuCount() catch 1;
-    const n_workers = @min(n_cpus, @min(children.items.len, 8));
-
+    const n_workers: usize = @min(n_cpus, 8);
     if (n_workers <= 1) {
-        var dir_count: usize = 0;
-        for (children.items) |child_path| {
-            try walkDir(allocator, io, child_path, lookup, results, 1, max_depth, progress_writer, &dir_count);
-        }
-        return;
+        return walkDir(allocator, io, root_path, lookup, results, 0, max_depth, tracker);
     }
+
+    var queue_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer queue_arena.deinit();
 
     var state: SharedScanState = .{
-        .allocator = allocator,
-        .results = results,
         .lookup = lookup,
         .io = io,
         .max_depth = max_depth,
-        .children = children.items,
+        .tracker = tracker,
+        .queue_alloc = queue_arena.allocator(),
+        .hungry = n_workers * 2,
     };
+
+    try state.pending.append(state.queue_alloc, .{
+        .path = try state.queue_alloc.dupe(u8, root_path),
+        .depth = 0,
+    });
+    state.pending_len.store(1, .monotonic);
 
     const n_spawned = n_workers - 1;
     const threads = try allocator.alloc(std.Thread, n_spawned);
 
+    const ctxs = try allocator.alloc(WorkerCtx, n_workers);
+    for (ctxs) |*ctx| ctx.* = WorkerCtx.init();
+    defer for (ctxs) |*ctx| ctx.arena.deinit();
+
     var spawned_count: usize = 0;
-    for (0..n_spawned) |_| {
-        threads[spawned_count] = std.Thread.spawn(.{}, workerThreadFn, .{&state}) catch break;
+    for (0..n_spawned) |i| {
+        threads[spawned_count] = std.Thread.spawn(.{}, workerLoop, .{ &state, &ctxs[i + 1], i + 1 }) catch break;
         spawned_count += 1;
     }
 
-    if (progress_writer != null) {
-        mainThreadWorkerWithProgress(&state, progress_writer.?);
-    } else {
-        workerThreadFn(&state);
-    }
+    workerLoop(&state, &ctxs[0], 0);
 
     for (threads[0..spawned_count]) |thread| {
         thread.join();
     }
-}
 
-fn workerThreadFn(state: *SharedScanState) void {
-    while (true) {
-        const idx = state.next_idx.fetchAdd(1, .monotonic);
-        if (idx >= state.children.len) return;
-        workerWalkDir(state, state.children[idx], 1);
-    }
-}
-
-fn mainThreadWorkerWithProgress(state: *SharedScanState, pw: *Io.Writer) void {
-    while (true) {
-        const idx = state.next_idx.fetchAdd(1, .monotonic);
-        if (idx >= state.children.len) return;
-
-        const count = state.dir_count.load(.monotonic);
-        if (count > 0) {
-            ui.printProgress(pw, count, state.children[idx]) catch {};
+    for (ctxs) |*ctx| {
+        for (ctx.results.items) |r| {
+            try results.append(allocator, .{
+                .path = try allocator.dupe(u8, r.path),
+                .size = r.size,
+                .rule = r.rule,
+            });
         }
-
-        workerWalkDir(state, state.children[idx], 1);
     }
 }
 
-fn workerWalkDir(state: *SharedScanState, path: []const u8, depth: u32) void {
+/// Drain the shared task queue until it is empty AND no worker is mid-task
+/// (an active worker may still push more tasks). Termination: the last
+/// worker to go idle broadcasts, waking the others to re-check and exit.
+fn workerLoop(state: *SharedScanState, ctx: *WorkerCtx, slot: usize) void {
+    const io = state.io;
+    state.mutex.lockUncancelable(io);
+    while (true) {
+        if (state.pending.pop()) |task| {
+            state.pending_len.store(state.pending.items.len, .monotonic);
+            state.active += 1;
+            state.mutex.unlock(io);
+
+            workerWalkDir(state, ctx, slot, task.path, task.depth);
+
+            state.mutex.lockUncancelable(io);
+            state.active -= 1;
+            if (state.active == 0 and state.pending.items.len == 0) {
+                state.cond.broadcast(io);
+                state.mutex.unlock(io);
+                return;
+            }
+        } else if (state.active == 0) {
+            state.mutex.unlock(io);
+            return;
+        } else {
+            state.cond.waitUncancelable(io, &state.mutex);
+        }
+    }
+}
+
+fn workerWalkDir(state: *SharedScanState, ctx: *WorkerCtx, slot: usize, path: []const u8, depth: u32) void {
     if (depth >= state.max_depth) return;
     if (platform.impl.isSkipDir(path)) return;
 
-    _ = state.dir_count.fetchAdd(1, .monotonic);
+    if (state.tracker) |t| t.addDir(slot, path);
 
-    var dir = Dir.openDirAbsolute(state.io, path, .{ .iterate = true }) catch return;
+    var dir = Dir.openDirAbsolute(state.io, path, .{ .iterate = true }) catch {
+        if (state.tracker) |t| t.addDenied();
+        return;
+    };
     defer dir.close(state.io);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = path.len;
+
+    const arena = ctx.arena.allocator();
 
     var iter = dir.iterate();
     while (iter.next(state.io) catch null) |entry| {
@@ -360,16 +384,12 @@ fn workerWalkDir(state: *SharedScanState, path: []const u8, depth: u32) void {
 
         if (entry.kind == .directory) {
             if (state.lookup.dir_names.get(entry.name)) |rule| {
-                const full_path = blk: {
-                    state.lock();
-                    defer state.unlock();
-                    break :blk std.fs.path.join(state.allocator, &.{ path, entry.name }) catch return;
-                };
-                const size = dirSize(state.io, full_path) catch 0;
+                const full_path = std.fs.path.join(arena, &.{ path, entry.name }) catch return;
+                if (state.tracker) |t| t.setPath(slot, full_path);
+                const size = dirSizeTracked(state.io, full_path, state.tracker) catch 0;
                 if (size > 0) {
-                    state.lock();
-                    defer state.unlock();
-                    state.results.append(state.allocator, .{
+                    if (state.tracker) |t| t.addItem(size);
+                    ctx.results.append(arena, .{
                         .path = full_path,
                         .size = size,
                         .rule = rule,
@@ -388,12 +408,10 @@ fn workerWalkDir(state: *SharedScanState, path: []const u8, depth: u32) void {
                 @memcpy(path_buf[0..path_len], path);
                 path_buf[path_len] = '/';
                 @memcpy(path_buf[path_len + 1 ..][0..name_len], entry.name);
-                const sub_path = blk: {
-                    state.lock();
-                    defer state.unlock();
-                    break :blk state.allocator.dupe(u8, path_buf[0..total_len]) catch return;
-                };
-                workerWalkDir(state, sub_path, depth + 1);
+                const sub_path = path_buf[0..total_len];
+                if (!state.tryPush(sub_path, depth + 1)) {
+                    workerWalkDir(state, ctx, slot, sub_path, depth + 1);
+                }
             }
         }
 
@@ -401,16 +419,11 @@ fn workerWalkDir(state: *SharedScanState, path: []const u8, depth: u32) void {
             if (state.lookup.marker_files.get(entry.name)) |rule| {
                 const mf = rule.detection.marker_file;
                 for (mf.targets) |target_name| {
-                    const target_path = blk: {
-                        state.lock();
-                        defer state.unlock();
-                        break :blk std.fs.path.join(state.allocator, &.{ path, target_name }) catch continue;
-                    };
-                    const size = dirSize(state.io, target_path) catch continue;
+                    const target_path = std.fs.path.join(arena, &.{ path, target_name }) catch continue;
+                    const size = dirSizeTracked(state.io, target_path, state.tracker) catch continue;
                     if (size > 0) {
-                        state.lock();
-                        defer state.unlock();
-                        state.results.append(state.allocator, .{
+                        if (state.tracker) |t| t.addItem(size);
+                        ctx.results.append(arena, .{
                             .path = target_path,
                             .size = size,
                             .rule = rule,
@@ -440,7 +453,7 @@ fn isInterestingHiddenDir(name: []const u8) bool {
     return false;
 }
 
-fn expandTilde(allocator: Allocator, path: []const u8, home: []const u8) ![]const u8 {
+pub fn expandTilde(allocator: Allocator, path: []const u8, home: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, path, "~/")) {
         return try std.fs.path.join(allocator, &.{ home, path[2..] });
     }
@@ -448,14 +461,20 @@ fn expandTilde(allocator: Allocator, path: []const u8, home: []const u8) ![]cons
 }
 
 pub fn dirSize(io: Io, path: []const u8) !u64 {
+    return dirSizeTracked(io, path, null);
+}
+
+/// Like `dirSize` but bumps live-progress counters while it stats files,
+/// so long size computations keep the status line moving.
+pub fn dirSizeTracked(io: Io, path: []const u8, tracker: ?*progress.Tracker) !u64 {
     var total: u64 = 0;
     var dir = try Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
-    try dirSizeRecurse(io, dir, &total, 0);
+    try dirSizeRecurse(io, dir, &total, 0, tracker);
     return total;
 }
 
-fn dirSizeRecurse(io: Io, dir: Dir, total: *u64, depth: u32) !void {
+fn dirSizeRecurse(io: Io, dir: Dir, total: *u64, depth: u32, tracker: ?*progress.Tracker) !void {
     if (depth > 50) return;
 
     var iter = dir.iterate();
@@ -465,12 +484,97 @@ fn dirSizeRecurse(io: Io, dir: Dir, total: *u64, depth: u32) !void {
         if (entry.kind == .file) {
             const stat = dir.statFile(io, entry.name, .{}) catch continue;
             total.* += stat.size;
+            if (tracker) |t| t.addFile();
         } else if (entry.kind == .directory) {
+            if (tracker) |t| t.addDirCount();
             var sub_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
             defer sub_dir.close(io);
-            dirSizeRecurse(io, sub_dir, total, depth + 1) catch continue;
+            dirSizeRecurse(io, sub_dir, total, depth + 1, tracker) catch continue;
         }
     }
+}
+
+/// Expanded absolute path -> path_prefix rule, for matching during sizedWalk.
+pub const PrefixLookup = std.StringHashMapUnmanaged(*const Rule);
+
+pub fn buildPrefixLookup(allocator: Allocator, home: []const u8) !PrefixLookup {
+    var map: PrefixLookup = .empty;
+    for (&rules_mod.all_rules) |*rule| {
+        switch (rule.detection) {
+            .path_prefix => |prefix| {
+                const expanded = try expandTilde(allocator, prefix, home);
+                try map.put(allocator, expanded, rule);
+            },
+            else => {},
+        }
+    }
+    return map;
+}
+
+/// Rule-aware sizing walk used by analyze: computes the full subtree size of
+/// `path` in one traversal while attributing directories that match cleanup
+/// rules to per-category totals.
+///
+/// `dir_matched` marks that an ancestor already matched a dir_name rule; it
+/// suppresses nested dir_name matches (the scan walker never descends into a
+/// matched dir, so e.g. node_modules inside node_modules counts once).
+/// path_prefix rules deliberately nest (`~/.cache` is a system rule while
+/// `~/.cache/pip` is a package rule) and are always attributed independently,
+/// matching how scan sizes each prefix rule on its own.
+pub fn sizedWalk(
+    io: Io,
+    path: []const u8,
+    lookup: *const RuleLookup,
+    prefixes: *const PrefixLookup,
+    categories: *ui.CategorySizes,
+    tracker: ?*progress.Tracker,
+    slot: usize,
+    depth: u32,
+    dir_matched: bool,
+) u64 {
+    if (depth > 50) return 0;
+    if (tracker) |t| t.addDir(slot, path);
+
+    var dir = Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch {
+        if (tracker) |t| t.addDenied();
+        return 0;
+    };
+    defer dir.close(io);
+
+    var total: u64 = 0;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = path.len;
+
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind == .sym_link) continue;
+
+        if (entry.kind == .file) {
+            const stat = dir.statFile(io, entry.name, .{}) catch continue;
+            total += stat.size;
+            if (tracker) |t| t.addFile();
+        } else if (entry.kind == .directory) {
+            const name_len = entry.name.len;
+            const total_len = path_len + 1 + name_len;
+            if (total_len > path_buf.len) continue;
+            @memcpy(path_buf[0..path_len], path);
+            path_buf[path_len] = '/';
+            @memcpy(path_buf[path_len + 1 ..][0..name_len], entry.name);
+            const sub_path = path_buf[0..total_len];
+
+            var dir_rule: ?*const Rule = null;
+            if (!dir_matched) {
+                if (lookup.dir_names.get(entry.name)) |r| dir_rule = r;
+            }
+            const prefix_rule: ?*const Rule = prefixes.get(sub_path);
+
+            const sub = sizedWalk(io, sub_path, lookup, prefixes, categories, tracker, slot, depth + 1, dir_matched or dir_rule != null);
+            if (dir_rule) |r| categories.add(r.category, sub);
+            if (prefix_rule) |r| categories.add(r.category, sub);
+            total += sub;
+        }
+    }
+    return total;
 }
 
 pub const PurgeOptions = struct {
@@ -509,8 +613,7 @@ pub fn purgeScan(allocator: Allocator, io: Io, root_path: []const u8, options: P
 
     const lookup = try RuleLookup.init(allocator, &marker_rules);
 
-    var dir_count: usize = 0;
-    try walkDir(allocator, io, root_path, &lookup, &results, 0, options.max_depth, null, &dir_count);
+    try walkDir(allocator, io, root_path, &lookup, &results, 0, options.max_depth, null);
 
     std.mem.sort(ScanResult, results.items, {}, struct {
         fn lessThan(_: void, a: ScanResult, b: ScanResult) bool {
@@ -555,7 +658,7 @@ test "purgeScan finds mock Rust project" {
     }
     artifact.close(io);
 
-    var results = try purgeScan(allocator, io, tmp, .{ .home = "/tmp" });
+    const results = try purgeScan(allocator, io, tmp, .{ .home = "/tmp" });
 
     try std.testing.expect(results.items.len >= 1);
     var found_target = false;
@@ -598,7 +701,7 @@ test "purgeScan depth limit respected" {
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
-        var results = try purgeScan(arena_state.allocator(), io, tmp, .{ .max_depth = 2, .home = "/tmp" });
+        const results = try purgeScan(arena_state.allocator(), io, tmp, .{ .max_depth = 2, .home = "/tmp" });
         var found = false;
         for (results.items) |result| {
             if (std.mem.endsWith(u8, result.path, "/target")) found = true;
@@ -609,13 +712,67 @@ test "purgeScan depth limit respected" {
     {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena_state.deinit();
-        var results = try purgeScan(arena_state.allocator(), io, tmp, .{ .max_depth = 10, .home = "/tmp" });
+        const results = try purgeScan(arena_state.allocator(), io, tmp, .{ .max_depth = 10, .home = "/tmp" });
         var found = false;
         for (results.items) |result| {
             if (std.mem.endsWith(u8, result.path, "/target")) found = true;
         }
         try std.testing.expect(found);
     }
+}
+
+test "scan empty root terminates" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const tmp = "/tmp/evi_scan_empty_test";
+    Dir.cwd().deleteTree(io, "tmp/evi_scan_empty_test") catch {};
+    Dir.createDirAbsolute(io, tmp, .default_dir) catch {};
+    defer Dir.cwd().deleteTree(io, "tmp/evi_scan_empty_test") catch {};
+
+    const results = try scan(arena_state.allocator(), io, tmp, .{ .category = .dev, .home = tmp });
+    try std.testing.expectEqual(@as(usize, 0), results.items.len);
+}
+
+test "scan deep single chain terminates and finds artifact" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const tmp = "/tmp/evi_scan_chain_test";
+    Dir.cwd().deleteTree(io, "tmp/evi_scan_chain_test") catch {};
+    Dir.createDirAbsolute(io, tmp, .default_dir) catch {};
+    defer Dir.cwd().deleteTree(io, "tmp/evi_scan_chain_test") catch {};
+
+    var path_buf: [512]u8 = undefined;
+    var len: usize = tmp.len;
+    @memcpy(path_buf[0..len], tmp);
+    for (0..12) |_| {
+        @memcpy(path_buf[len..][0..2], "/d");
+        len += 2;
+        Dir.createDirAbsolute(io, path_buf[0..len], .default_dir) catch {};
+    }
+
+    const nm = try std.fmt.allocPrint(allocator, "{s}/node_modules", .{path_buf[0..len]});
+    Dir.createDirAbsolute(io, nm, .default_dir) catch {};
+    const artifact_path = try std.fmt.allocPrint(allocator, "{s}/mod.js", .{nm});
+    var artifact = Dir.createFileAbsolute(io, artifact_path, .{}) catch return;
+    {
+        var buf: [64]u8 = undefined;
+        var writer: Io.File.Writer = .init(artifact, io, &buf);
+        writer.interface.print("module content placeholder", .{}) catch {};
+        writer.interface.flush() catch {};
+    }
+    artifact.close(io);
+
+    const results = try scan(allocator, io, tmp, .{ .category = .dev, .home = tmp });
+    var found = false;
+    for (results.items) |r| {
+        if (std.mem.endsWith(u8, r.path, "/node_modules")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "purgeScan only uses marker_file rules" {

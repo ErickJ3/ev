@@ -66,8 +66,10 @@ pub const SystemInfo = struct {
 
 /// Shared state for parallel system info gathering.
 /// Each field is written by exactly one thread, so no mutex needed.
+/// Workers allocate ONLY from their own arena (the caller's arena is not
+/// thread-safe); the caller deep-copies results out after joining.
 const AsyncSystemInfo = struct {
-    // Written by thread 1 (CPU usage - has 50ms busy-wait)
+    // Written by thread 1 (CPU usage - 250ms sample window)
     cpu_usage_percent: f64 = 0.0,
     // Written by thread 2 (process enumeration - reads many /proc/PID/status files)
     top_processes: []const ProcessInfo = &.{},
@@ -77,15 +79,16 @@ const AsyncSystemInfo = struct {
     pkg_info: PackageInfo = .{ .count = 0, .manager = "unknown" },
 };
 
-fn cpuUsageWorker(allocator: Allocator, io: Io, out: *AsyncSystemInfo) void {
-    out.cpu_usage_percent = readCpuUsage(allocator, io);
+fn cpuUsageWorker(arena: *std.heap.ArenaAllocator, io: Io, out: *AsyncSystemInfo) void {
+    out.cpu_usage_percent = readCpuUsage(arena.allocator(), io);
 }
 
-fn processWorker(allocator: Allocator, io: Io, out: *AsyncSystemInfo) void {
-    out.top_processes = readTopProcesses(allocator, io);
+fn processWorker(arena: *std.heap.ArenaAllocator, io: Io, out: *AsyncSystemInfo) void {
+    out.top_processes = readTopProcesses(arena.allocator(), io);
 }
 
-fn subprocessWorker(allocator: Allocator, io: Io, out: *AsyncSystemInfo) void {
+fn subprocessWorker(arena: *std.heap.ArenaAllocator, io: Io, out: *AsyncSystemInfo) void {
+    const allocator = arena.allocator();
     out.filesystems = readFilesystems(allocator, io);
     out.service_count = readServiceCount(allocator, io);
     out.pkg_info = readPackageInfo(allocator, io);
@@ -96,12 +99,19 @@ pub fn getSystemInfo(allocator: Allocator, io: Io) !SystemInfo {
     const cpu_info = readCpuInfo(allocator, io);
     const mem_info = readMemInfo(allocator, io);
 
-    // Spawn threads for slow operations
+    // Spawn threads for slow operations, each with its own arena
     var async_info: AsyncSystemInfo = .{};
 
-    const t1 = std.Thread.spawn(.{}, cpuUsageWorker, .{ allocator, io, &async_info }) catch null;
-    const t2 = std.Thread.spawn(.{}, processWorker, .{ allocator, io, &async_info }) catch null;
-    const t3 = std.Thread.spawn(.{}, subprocessWorker, .{ allocator, io, &async_info }) catch null;
+    var worker_arenas: [3]std.heap.ArenaAllocator = .{
+        std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    };
+    defer for (&worker_arenas) |*a| a.deinit();
+
+    const t1 = std.Thread.spawn(.{}, cpuUsageWorker, .{ &worker_arenas[0], io, &async_info }) catch null;
+    const t2 = std.Thread.spawn(.{}, processWorker, .{ &worker_arenas[1], io, &async_info }) catch null;
+    const t3 = std.Thread.spawn(.{}, subprocessWorker, .{ &worker_arenas[2], io, &async_info }) catch null;
 
     // Main thread does remaining fast /proc reads while workers run
     const load_avg = readLoadAvg(allocator, io);
@@ -109,10 +119,38 @@ pub fn getSystemInfo(allocator: Allocator, io: Io) !SystemInfo {
     const os_version = readOsVersion(allocator, io);
     const interfaces = readNetworkInterfaces(allocator, io);
 
-    // Wait for workers
-    if (t1) |t| t.join();
-    if (t2) |t| t.join();
-    if (t3) |t| t.join();
+    // Wait for workers; on spawn failure run inline so the dashboard still has data
+    if (t1) |t| t.join() else cpuUsageWorker(&worker_arenas[0], io, &async_info);
+    if (t2) |t| t.join() else processWorker(&worker_arenas[1], io, &async_info);
+    if (t3) |t| t.join() else subprocessWorker(&worker_arenas[2], io, &async_info);
+
+    // Deep-copy worker results into the caller's arena before the worker
+    // arenas are torn down. pkg_info.manager is always a static string.
+    const top_processes = blk: {
+        const copy = allocator.alloc(ProcessInfo, async_info.top_processes.len) catch break :blk &[_]ProcessInfo{};
+        for (copy, async_info.top_processes) |*dst, src| {
+            dst.* = .{
+                .pid = src.pid,
+                .proc_name = allocator.dupe(u8, src.proc_name) catch "?",
+                .mem_rss = src.mem_rss,
+            };
+        }
+        break :blk copy;
+    };
+
+    const filesystems = blk: {
+        const copy = allocator.alloc(FilesystemInfo, async_info.filesystems.len) catch break :blk &[_]FilesystemInfo{};
+        for (copy, async_info.filesystems) |*dst, src| {
+            dst.* = .{
+                .mount_point = allocator.dupe(u8, src.mount_point) catch "?",
+                .fs_type = allocator.dupe(u8, src.fs_type) catch "?",
+                .total = src.total,
+                .used = src.used,
+                .available = src.available,
+            };
+        }
+        break :blk copy;
+    };
 
     return .{
         .cpu_model = cpu_info.model,
@@ -125,9 +163,9 @@ pub fn getSystemInfo(allocator: Allocator, io: Io) !SystemInfo {
         .swap_free = mem_info.swap_free,
         .uptime_seconds = uptime,
         .os_version = os_version,
-        .filesystems = async_info.filesystems,
+        .filesystems = filesystems,
         .interfaces = interfaces,
-        .top_processes = async_info.top_processes,
+        .top_processes = top_processes,
         .service_count = async_info.service_count,
         .service_manager = "systemd",
         .package_count = async_info.pkg_info.count,
@@ -177,11 +215,9 @@ fn readCpuInfo(allocator: Allocator, io: Io) CpuInfo {
 
 fn readCpuUsage(allocator: Allocator, io: Io) f64 {
     const sample1 = readCpuSample(allocator, io) orelse return 0.0;
-    // Small busy-wait (~50ms)
-    var i: u32 = 0;
-    while (i < 500_000) : (i += 1) {
-        std.mem.doNotOptimizeAway(&i);
-    }
+    // Honest sample window; runs concurrently with the subprocess worker,
+    // so it rarely extends total wall time.
+    io.sleep(.fromMilliseconds(250), .awake) catch {};
     const sample2 = readCpuSample(allocator, io) orelse return 0.0;
 
     const idle_delta = sample2.idle -| sample1.idle;
@@ -304,6 +340,28 @@ fn readFilesystems(allocator: Allocator, io: Io) []const FilesystemInfo {
         }) catch continue;
     }
     return list.toOwnedSlice(allocator) catch &.{};
+}
+
+pub const DiskUsage = struct {
+    total: u64,
+    used: u64,
+    available: u64,
+};
+
+/// Disk usage of the filesystem containing `path`, via `df` (std has no
+/// statfs wrapper). Returns null on any failure.
+pub fn diskUsage(allocator: Allocator, io: Io, path: []const u8) ?DiskUsage {
+    const result = runCommand(allocator, io, &.{ "timeout", "5", "df", "-B1", "--output=size,used,avail", path }) catch return null;
+    defer allocator.free(result);
+
+    var lines = std.mem.splitScalar(u8, result, '\n');
+    _ = lines.next(); // header
+    const line = lines.next() orelse return null;
+    var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    const total = std.fmt.parseInt(u64, tokens.next() orelse return null, 10) catch return null;
+    const used = std.fmt.parseInt(u64, tokens.next() orelse return null, 10) catch return null;
+    const avail = std.fmt.parseInt(u64, tokens.next() orelse return null, 10) catch return null;
+    return .{ .total = total, .used = used, .available = avail };
 }
 
 fn isRealFs(fs_type: []const u8) bool {

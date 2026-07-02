@@ -74,6 +74,10 @@ fn innerMain(init: std.process.Init) !void {
 
     const home: []const u8 = init.environ_map.get("HOME") orelse "/tmp";
 
+    const stdout_tty = Io.File.stdout().isTty(init.io) catch false;
+    const no_color = if (init.environ_map.get("NO_COLOR")) |v| v.len > 0 else false;
+    evi.ui.initColors(stdout_tty and !no_color);
+
     if (res.args.help != 0) {
         try printUsage(stdout);
         try stdout.flush();
@@ -104,6 +108,13 @@ fn innerMain(init: std.process.Init) !void {
 
     try stdout.flush();
     try stderr.flush();
+}
+
+/// Progress lines belong on stderr, and only when a human is watching:
+/// returns `stderr` if it is a TTY, null otherwise (pipes, redirects, CI).
+fn progressWriter(io: Io, stderr: *Io.Writer) ?*Io.Writer {
+    const is_tty = Io.File.stderr().isTty(io) catch false;
+    return if (is_tty) stderr else null;
 }
 
 fn cmdScan(
@@ -161,7 +172,7 @@ fn cmdScan(
     var results = try evi.scanner.scan(arena, io, target_path, .{
         .category = category,
         .home = home,
-        .progress_writer = stderr,
+        .progress_writer = progressWriter(io, stderr),
     });
     defer results.deinit(arena);
 
@@ -268,7 +279,7 @@ fn cmdClean(
     var results = try evi.scanner.scan(arena, io, home, .{
         .category = category,
         .home = home,
-        .progress_writer = stderr,
+        .progress_writer = progressWriter(io, stderr),
     });
     defer results.deinit(arena);
 
@@ -297,7 +308,15 @@ fn cmdClean(
             return;
         },
         .force => {
-            const clean_result = evi.cleaner.clean(io, results.items, null, .force, &cfg, &log);
+            var tracker: evi.progress.Tracker = .{ .total = results.items.len };
+            var ticker: ?evi.progress.Ticker = null;
+            if (progressWriter(io, stderr)) |pw| {
+                ticker = evi.progress.Ticker.init(io, pw, &tracker, "Deleting", "items");
+                ticker.?.items_verb = "freed";
+                ticker.?.begin();
+            }
+            const clean_result = evi.cleaner.clean(io, results.items, null, .force, &cfg, &log, &tracker);
+            if (ticker) |*t| t.end();
             try evi.ui.printCleanSummary(stdout, width, clean_result.deleted_count, clean_result.deleted_size, clean_result.skipped_count, clean_result.error_count);
             return;
         },
@@ -339,13 +358,21 @@ fn cmdClean(
     }
 
     var clean_result: evi.cleaner.CleanResult = .{};
-    for (selected_indices, 0..) |idx, i| {
-        if (idx >= results.items.len) continue;
-        try evi.ui.printDeleteProgress(stdout, i + 1, selected_indices.len, clean_result.deleted_size, results.items[idx].path);
-        try stdout.flush();
-        evi.cleaner.cleanItem(io, results.items[idx], .force, &cfg, &log, &clean_result);
+    {
+        var tracker: evi.progress.Tracker = .{ .total = selected_indices.len };
+        var ticker: ?evi.progress.Ticker = null;
+        if (progressWriter(io, stderr)) |pw| {
+            ticker = evi.progress.Ticker.init(io, pw, &tracker, "Deleting", "items");
+            ticker.?.items_verb = "freed";
+            ticker.?.begin();
+        }
+        defer if (ticker) |*t| t.end();
+
+        for (selected_indices) |idx| {
+            if (idx >= results.items.len) continue;
+            evi.cleaner.cleanItem(io, results.items[idx], .force, &cfg, &log, &clean_result, &tracker);
+        }
     }
-    try evi.ui.clearDeleteProgress(stdout);
 
     if (clean_result.deleted_count > 0) {
         log.logSummary(clean_result.deleted_count, clean_result.deleted_size);
@@ -450,7 +477,15 @@ fn cmdPurge(
             return;
         },
         .force => {
-            const clean_result = evi.cleaner.clean(io, results.items, null, .force, &cfg, &log);
+            var tracker: evi.progress.Tracker = .{ .total = results.items.len };
+            var ticker: ?evi.progress.Ticker = null;
+            if (progressWriter(io, stderr)) |pw| {
+                ticker = evi.progress.Ticker.init(io, pw, &tracker, "Deleting", "items");
+                ticker.?.items_verb = "freed";
+                ticker.?.begin();
+            }
+            const clean_result = evi.cleaner.clean(io, results.items, null, .force, &cfg, &log, &tracker);
+            if (ticker) |*t| t.end();
             try evi.ui.printCleanSummary(stdout, width, clean_result.deleted_count, clean_result.deleted_size, clean_result.skipped_count, clean_result.error_count);
             return;
         },
@@ -489,13 +524,21 @@ fn cmdPurge(
     }
 
     var clean_result: evi.cleaner.CleanResult = .{};
-    for (selected_indices, 0..) |idx, i| {
-        if (idx >= results.items.len) continue;
-        try evi.ui.printDeleteProgress(stdout, i + 1, selected_indices.len, clean_result.deleted_size, results.items[idx].path);
-        try stdout.flush();
-        evi.cleaner.cleanItem(io, results.items[idx], .force, &cfg, &log, &clean_result);
+    {
+        var tracker: evi.progress.Tracker = .{ .total = selected_indices.len };
+        var ticker: ?evi.progress.Ticker = null;
+        if (progressWriter(io, stderr)) |pw| {
+            ticker = evi.progress.Ticker.init(io, pw, &tracker, "Deleting", "items");
+            ticker.?.items_verb = "freed";
+            ticker.?.begin();
+        }
+        defer if (ticker) |*t| t.end();
+
+        for (selected_indices) |idx| {
+            if (idx >= results.items.len) continue;
+            evi.cleaner.cleanItem(io, results.items[idx], .force, &cfg, &log, &clean_result, &tracker);
+        }
     }
-    try evi.ui.clearDeleteProgress(stdout);
 
     if (clean_result.deleted_count > 0) {
         log.logSummary(clean_result.deleted_count, clean_result.deleted_size);
@@ -556,7 +599,7 @@ fn cmdAnalyze(
         .max_depth = max_depth,
         .top_n = top_n,
         .home = home,
-        .progress_writer = stderr,
+        .progress_writer = progressWriter(io, stderr),
     });
 
     try evi.analyzer.printReport(stdout, target, report, width);
@@ -598,7 +641,18 @@ fn cmdStatus(
     }
 
     const width = evi.ui.getTerminalWidth();
-    try evi.monitor.printDashboard(arena, io, stdout, width);
+
+    var tracker: evi.progress.Tracker = .{};
+    var ticker: ?evi.progress.Ticker = null;
+    if (progressWriter(io, stderr)) |pw| {
+        ticker = evi.progress.Ticker.init(io, pw, &tracker, "Collecting system info", "");
+        ticker.?.begin();
+    }
+
+    const info = evi.platform.impl.getSystemInfo(arena, io);
+    if (ticker) |*t| t.end();
+
+    try evi.monitor.renderDashboard(stdout, try info, width);
 }
 
 fn cmdConfig(

@@ -5,6 +5,7 @@ const scanner = @import("scanner.zig");
 const rules_mod = @import("rules.zig");
 const platform = @import("platform.zig");
 const ui = @import("ui.zig");
+const evi_progress = @import("progress.zig");
 const Allocator = std.mem.Allocator;
 
 pub const AnalyzeResult = struct {
@@ -23,6 +24,15 @@ pub const AnalyzeOptions = struct {
 pub const AnalysisReport = struct {
     top_dirs: []const AnalyzeResult,
     category_sizes: ui.CategorySizes,
+    /// Sum of ALL scanned entries, not just the displayed top N.
+    scanned_total: u64,
+    /// Number of scanned entries with size > 0.
+    entry_count: usize,
+    /// Usage of the filesystem containing the analyzed path, when available.
+    disk: ?platform.impl.DiskUsage,
+    /// Directories the walk could not open (permissions). A large number
+    /// usually means running without root misses part of the disk.
+    denied_count: usize,
 };
 
 const DirSizeEntry = struct {
@@ -31,49 +41,46 @@ const DirSizeEntry = struct {
     is_dir: bool,
 };
 
+/// Work-stealing state for sizing top-level entries. Entries are claimed via
+/// the atomic index; each entry is written by exactly one worker, and every
+/// worker accumulates category sizes into its own `CategorySizes` (merged
+/// after join), so there is no shared mutable state to lock.
 const DirSizeState = struct {
-    mutex: std.atomic.Mutex = .unlocked,
     io: Io,
     entries: []DirSizeEntry,
+    lookup: *const scanner.RuleLookup,
+    prefixes: *const scanner.PrefixLookup,
     next_idx: std.atomic.Value(usize) = .init(0),
-    progress_count: std.atomic.Value(usize) = .init(0),
-
-    fn lock(self: *DirSizeState) void {
-        while (!self.mutex.tryLock()) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    fn unlock(self: *DirSizeState) void {
-        self.mutex.unlock();
-    }
+    tracker: ?*evi_progress.Tracker = null,
 };
 
-fn dirSizeWorker(state: *DirSizeState) void {
+fn sizeEntry(state: *DirSizeState, entry: *DirSizeEntry, categories: *ui.CategorySizes, slot: usize) void {
+    if (state.tracker) |t| t.setPath(slot, entry.path);
+    if (entry.is_dir) {
+        const base = std.fs.path.basename(entry.path);
+        const dir_rule: ?*const rules_mod.Rule = state.lookup.dir_names.get(base);
+        const prefix_rule: ?*const rules_mod.Rule = state.prefixes.get(entry.path);
+        entry.size = scanner.sizedWalk(state.io, entry.path, state.lookup, state.prefixes, categories, state.tracker, slot, 0, dir_rule != null);
+        if (dir_rule) |r| categories.add(r.category, entry.size);
+        if (prefix_rule) |r| categories.add(r.category, entry.size);
+    }
+    if (state.tracker) |t| t.addDone();
+}
+
+fn dirSizeWorker(state: *DirSizeState, categories: *ui.CategorySizes, slot: usize) void {
     while (true) {
         const idx = state.next_idx.fetchAdd(1, .monotonic);
         if (idx >= state.entries.len) return;
-
-        const entry = &state.entries[idx];
-        if (entry.is_dir) {
-            entry.size = scanner.dirSize(state.io, entry.path) catch 0;
-        }
-        _ = state.progress_count.fetchAdd(1, .monotonic);
+        sizeEntry(state, &state.entries[idx], categories, slot);
     }
 }
 
 /// Analyze disk usage under root_path.
 /// Returns top N largest children and a per-category size breakdown.
+/// One traversal computes both: sizes are summed while rule matches are
+/// attributed to categories on the way down.
 pub fn analyze(allocator: Allocator, io: Io, root_path: []const u8, options: AnalyzeOptions) !AnalysisReport {
     var category_sizes: ui.CategorySizes = .{};
-    var scan_results = scanner.scan(allocator, io, root_path, .{
-        .home = options.home,
-        .max_depth = options.max_depth,
-    }) catch scanner.ResultList.empty;
-
-    for (scan_results.items) |result| {
-        category_sizes.add(result.rule.category, result.size);
-    }
 
     var entries: std.ArrayList(DirSizeEntry) = .empty;
 
@@ -99,6 +106,18 @@ pub fn analyze(allocator: Allocator, io: Io, root_path: []const u8, options: Ana
         }
     }
 
+    const lookup = try scanner.RuleLookup.initFromRules(allocator, &rules_mod.all_rules);
+    var prefixes = try scanner.buildPrefixLookup(allocator, options.home);
+    defer prefixes.deinit(allocator);
+
+    var tracker: evi_progress.Tracker = .{ .total = entries.items.len };
+    var ticker: ?evi_progress.Ticker = null;
+    if (options.progress_writer) |pw| {
+        ticker = evi_progress.Ticker.init(io, pw, &tracker, "Analyzing", "entries");
+        ticker.?.begin();
+    }
+    defer if (ticker) |*t| t.end();
+
     if (entries.items.len > 0) {
         const n_cpus = std.Thread.getCpuCount() catch 1;
         const n_workers = @min(n_cpus, @min(entries.items.len, 8));
@@ -106,55 +125,47 @@ pub fn analyze(allocator: Allocator, io: Io, root_path: []const u8, options: Ana
         var state: DirSizeState = .{
             .io = io,
             .entries = entries.items,
+            .lookup = &lookup,
+            .prefixes = &prefixes,
+            .tracker = &tracker,
         };
 
         if (n_workers > 1) {
             const n_spawned = n_workers - 1;
             const threads = try allocator.alloc(std.Thread, n_spawned);
+            const worker_cats = try allocator.alloc(ui.CategorySizes, n_workers);
+            for (worker_cats) |*c| c.* = .{};
+
             var spawned_count: usize = 0;
-            for (0..n_spawned) |_| {
-                threads[spawned_count] = std.Thread.spawn(.{}, dirSizeWorker, .{&state}) catch break;
+            for (0..n_spawned) |i| {
+                threads[spawned_count] = std.Thread.spawn(.{}, dirSizeWorker, .{ &state, &worker_cats[i + 1], i + 1 }) catch break;
                 spawned_count += 1;
             }
 
-            while (true) {
-                const idx = state.next_idx.fetchAdd(1, .monotonic);
-                if (idx >= state.entries.len) break;
-
-                if (options.progress_writer) |pw| {
-                    const done = state.progress_count.load(.monotonic);
-                    ui.printProgress(pw, done, state.entries[idx].path) catch {};
-                }
-
-                const entry = &state.entries[idx];
-                if (entry.is_dir) {
-                    entry.size = scanner.dirSize(io, entry.path) catch 0;
-                }
-                _ = state.progress_count.fetchAdd(1, .monotonic);
-            }
+            dirSizeWorker(&state, &worker_cats[0], 0);
 
             for (threads[0..spawned_count]) |thread| {
                 thread.join();
             }
+
+            for (worker_cats) |c| {
+                inline for (@typeInfo(rules_mod.Category).@"enum".fields) |field| {
+                    const cat: rules_mod.Category = @enumFromInt(field.value);
+                    category_sizes.add(cat, c.get(cat));
+                }
+            }
         } else {
-            for (entries.items, 0..) |*entry, i| {
-                if (options.progress_writer) |pw| {
-                    ui.printProgress(pw, i, entry.path) catch {};
-                }
-                if (entry.is_dir) {
-                    entry.size = scanner.dirSize(io, entry.path) catch 0;
-                }
+            for (entries.items) |*entry| {
+                sizeEntry(&state, entry, &category_sizes, 0);
             }
         }
     }
 
-    if (options.progress_writer) |pw| {
-        try ui.clearProgress(pw);
-    }
-
     var top_dirs: std.ArrayList(AnalyzeResult) = .empty;
+    var scanned_total: u64 = 0;
     for (entries.items) |entry| {
         if (entry.size > 0) {
+            scanned_total += entry.size;
             try top_dirs.append(allocator, .{
                 .path = entry.path,
                 .size = entry.size,
@@ -174,19 +185,20 @@ pub fn analyze(allocator: Allocator, io: Io, root_path: []const u8, options: Ana
     return .{
         .top_dirs = top_dirs.items[0..count],
         .category_sizes = category_sizes,
+        .scanned_total = scanned_total,
+        .entry_count = top_dirs.items.len,
+        .disk = platform.impl.diskUsage(allocator, io, root_path),
+        .denied_count = tracker.dirs_denied.load(.monotonic),
     };
 }
 
 pub fn printReport(writer: anytype, root_path: []const u8, report: AnalysisReport, raw_width: u16) !void {
     const width = @min(raw_width, 80);
-    var total_size: u64 = 0;
-    for (report.top_dirs) |item| {
-        total_size += item.size;
-    }
+    const total_size = report.scanned_total;
     var detail_buf: [256]u8 = undefined;
     var total_buf: [32]u8 = undefined;
     const total_str = ui.formatSize(&total_buf, total_size);
-    const detail = std.fmt.bufPrint(&detail_buf, "{s} \xc2\xb7 Total: {s}", .{ root_path, total_str }) catch root_path;
+    const detail = std.fmt.bufPrint(&detail_buf, "{s} \xc2\xb7 {s}", .{ root_path, total_str }) catch root_path;
 
     try ui.printBrandedHeader(writer, "analyze", detail, width);
 
@@ -248,10 +260,14 @@ pub fn printReport(writer: anytype, root_path: []const u8, report: AnalysisRepor
         try writer.print(" {s}{d:>5.1}%{s}", .{ ui.Color.bright_white, pct, ui.Color.reset });
         try writer.print("  {s}" ++ ui.Box.v_line ++ "{s}  ", .{ ui.Color.fg_dark_gray, ui.Color.reset });
 
-        const display_path = if (std.mem.startsWith(u8, item.path, root_path) and item.path.len > root_path.len + 1)
-            item.path[root_path.len + 1 ..]
-        else
-            item.path;
+        const display_path = blk: {
+            if (std.mem.startsWith(u8, item.path, root_path) and item.path.len > root_path.len) {
+                var rest = item.path[root_path.len..];
+                while (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+                if (rest.len > 0) break :blk rest;
+            }
+            break :blk item.path;
+        };
 
         const max_name: usize = 20;
         const name = if (display_path.len > max_name) display_path[0..max_name] else display_path;
@@ -274,10 +290,63 @@ pub fn printReport(writer: anytype, root_path: []const u8, report: AnalysisRepor
     try writer.writeAll(ui.Color.fg_medium_gray);
     try writer.writeAll(ui.Box.h_line);
     try writer.writeAll(ui.Color.reset);
-    try writer.print(" Total: {s}{s}{s} across {s}{d}{s} entries\n\n", .{
-        ui.Color.bright_white, total_str,           ui.Color.reset,
-        ui.Color.bright_white, report.top_dirs.len, ui.Color.reset,
+    try writer.print(" Scanned: {s}{s}{s} across {s}{d}{s} entries (top {d} shown)", .{
+        ui.Color.bright_white, total_str,          ui.Color.reset,
+        ui.Color.bright_white, report.entry_count, ui.Color.reset,
+        report.top_dirs.len,
     });
+    if (report.denied_count > 0) {
+        try writer.print(" {s}\xc2\xb7 {d} dirs inaccessible{s}", .{
+            ui.Color.yellow, report.denied_count, ui.Color.reset,
+        });
+    }
+    try writer.writeAll("\n");
+
+    if (report.disk) |disk| {
+        var used_buf: [32]u8 = undefined;
+        var disk_total_buf: [32]u8 = undefined;
+        var free_buf: [32]u8 = undefined;
+        const disk_pct: f64 = if (disk.total > 0)
+            @as(f64, @floatFromInt(disk.used)) * 100.0 / @as(f64, @floatFromInt(disk.total))
+        else
+            0.0;
+        try writer.writeAll(" ");
+        try writer.writeAll(ui.Color.fg_medium_gray);
+        try writer.writeAll(ui.Box.h_line);
+        try writer.writeAll(ui.Color.reset);
+        try writer.print(" Disk: {s}{s}{s} / {s} used ({s}{d:.0}%{s}) \xc2\xb7 {s}{s}{s} free\n", .{
+            ui.usageColor(disk_pct),
+            ui.formatSize(&used_buf, disk.used),
+            ui.Color.reset,
+            ui.formatSize(&disk_total_buf, disk.total),
+            ui.Color.bright_white,
+            disk_pct,
+            ui.Color.reset,
+            ui.Color.bright_green,
+            ui.formatSize(&free_buf, disk.available),
+            ui.Color.reset,
+        });
+
+        // Surface the difference between what the walk saw and what the
+        // filesystem reports: inaccessible dirs, other mounts/subvolumes,
+        // btrfs snapshots. Only when the gap is meaningful (>5% of used).
+        if (disk.used > total_size) {
+            const gap = disk.used - total_size;
+            if (gap > disk.used / 20) {
+                var gap_buf: [32]u8 = undefined;
+                try writer.writeAll(" ");
+                try writer.writeAll(ui.Color.fg_medium_gray);
+                try writer.writeAll(ui.Box.h_line);
+                try writer.writeAll(ui.Color.reset);
+                try writer.print(" Not scanned: {s}{s}{s} (outside this path, inaccessible dirs, or snapshots)\n", .{
+                    ui.Color.yellow,
+                    ui.formatSize(&gap_buf, gap),
+                    ui.Color.reset,
+                });
+            }
+        }
+    }
+    try writer.writeAll("\n");
 }
 
 test "AnalyzeResult sorting" {

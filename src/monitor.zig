@@ -31,6 +31,12 @@ const GridLayout = struct {
 
 pub fn printDashboard(allocator: Allocator, io: Io, writer: anytype, width: u16) !void {
     const info = try platform.impl.getSystemInfo(allocator, io);
+    try renderDashboard(writer, info, width);
+}
+
+/// Render a pre-gathered SystemInfo, letting callers show progress while
+/// `getSystemInfo` runs.
+pub fn renderDashboard(writer: anytype, info: anytype, width: u16) !void {
     const w = @min(width, 80);
     const grid = GridLayout.init(w);
     var detail_buf: [256]u8 = undefined;
@@ -163,7 +169,14 @@ fn printDashboardWide(writer: anytype, info: anytype, grid: GridLayout, buf1: *[
                     0.0;
                 const mp = truncStr(fs.mount_point, 7);
                 try writer.print(" {s:<7}  ", .{mp});
-                try ui.printCompactBar(writer, pct, grid.bar_w);
+                // Shorter bar than CPU/mem rows to make room for used/total
+                try ui.printCompactBar(writer, pct, @min(grid.bar_w, 10));
+                var short_a: [16]u8 = undefined;
+                var short_b: [16]u8 = undefined;
+                try writer.print(" {s}{s}{s}/{s}{s}{s}", .{
+                    ui.Color.bright_white,   ui.formatSizeShort(&short_a, fs.used),  ui.Color.reset,
+                    ui.Color.fg_medium_gray, ui.formatSizeShort(&short_b, fs.total), ui.Color.reset,
+                });
             }
             if (row < info.interfaces.len) {
                 const iface = info.interfaces[row];

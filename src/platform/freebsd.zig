@@ -86,6 +86,29 @@ pub fn getSystemInfo(allocator: Allocator, io: Io) !SystemInfo {
     };
 }
 
+pub const DiskUsage = struct {
+    total: u64,
+    used: u64,
+    available: u64,
+};
+
+/// Disk usage of the filesystem containing `path`, via POSIX `df -P -k`.
+/// Returns null on any failure.
+pub fn diskUsage(allocator: Allocator, io: Io, path: []const u8) ?DiskUsage {
+    const result = runCommand(allocator, io, &.{ "df", "-P", "-k", path }) catch return null;
+    defer allocator.free(result);
+
+    var lines = std.mem.splitScalar(u8, result, '\n');
+    _ = lines.next(); // header
+    const line = lines.next() orelse return null;
+    var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    _ = tokens.next(); // filesystem name
+    const total_kb = std.fmt.parseInt(u64, tokens.next() orelse return null, 10) catch return null;
+    const used_kb = std.fmt.parseInt(u64, tokens.next() orelse return null, 10) catch return null;
+    const avail_kb = std.fmt.parseInt(u64, tokens.next() orelse return null, 10) catch return null;
+    return .{ .total = total_kb * 1024, .used = used_kb * 1024, .available = avail_kb * 1024 };
+}
+
 fn sysctlString(allocator: Allocator, io: Io, oid: []const u8) []const u8 {
     const result = runCommand(allocator, io, &.{ "sysctl", "-n", oid }) catch return "Unknown";
     return std.mem.trim(u8, result, &std.ascii.whitespace);

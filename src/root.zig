@@ -8,8 +8,10 @@ pub const logger = @import("logger.zig");
 pub const tui = @import("tui.zig");
 pub const analyzer = @import("analyzer.zig");
 pub const monitor = @import("monitor.zig");
+pub const progress = @import("progress.zig");
 
 test {
+    _ = progress;
     _ = rules;
     _ = scanner;
     _ = ui;

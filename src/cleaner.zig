@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const config_mod = @import("config.zig");
 const logger_mod = @import("logger.zig");
+const progress = @import("progress.zig");
 
 pub const CleanMode = enum {
     dry_run,
@@ -36,17 +37,18 @@ pub fn clean(
     mode: CleanMode,
     cfg: *const config_mod.Config,
     log: ?*logger_mod.Logger,
+    tracker: ?*progress.Tracker,
 ) CleanResult {
     var result: CleanResult = .{};
 
     if (selected) |indices| {
         for (indices) |idx| {
             if (idx >= results.len) continue;
-            cleanItem(io, results[idx], mode, cfg, log, &result);
+            cleanItem(io, results[idx], mode, cfg, log, &result, tracker);
         }
     } else {
         for (results) |item| {
-            cleanItem(io, item, mode, cfg, log, &result);
+            cleanItem(io, item, mode, cfg, log, &result, tracker);
         }
     }
 
@@ -66,7 +68,11 @@ pub fn cleanItem(
     cfg: *const config_mod.Config,
     log: ?*logger_mod.Logger,
     result: *CleanResult,
+    tracker: ?*progress.Tracker,
 ) void {
+    if (tracker) |t| t.setPath(0, item.path);
+    defer if (tracker) |t| t.addDone();
+
     if (cfg.isWhitelisted(item.path)) {
         result.skipped_count += 1;
         return;
@@ -85,6 +91,7 @@ pub fn cleanItem(
 
     result.deleted_count += 1;
     result.deleted_size += item.size;
+    if (tracker) |t| t.addItem(item.size);
 
     if (log) |l| {
         l.logDeletion(item.path, item.size, item.rule.category.label());
@@ -153,7 +160,7 @@ test "clean dry_run does not delete" {
         makeTestResult(target, 1024, &test_rule),
     };
 
-    const clean_result = clean(io, &results, null, .dry_run, &cfg, null);
+    const clean_result = clean(io, &results, null, .dry_run, &cfg, null, null);
 
     try std.testing.expectEqual(@as(usize, 1), clean_result.deleted_count);
     try std.testing.expectEqual(@as(u64, 1024), clean_result.deleted_size);
@@ -185,7 +192,7 @@ test "clean force deletes directories" {
         makeTestResult(target, 1024, &test_rule),
     };
 
-    const clean_result = clean(io, &results, null, .force, &cfg, null);
+    const clean_result = clean(io, &results, null, .force, &cfg, null, null);
 
     try std.testing.expectEqual(@as(usize, 1), clean_result.deleted_count);
 
@@ -218,7 +225,7 @@ test "clean skips whitelisted paths" {
         makeTestResult(target, 1024, &test_rule),
     };
 
-    const clean_result = clean(io, &results, null, .force, &cfg, null);
+    const clean_result = clean(io, &results, null, .force, &cfg, null, null);
 
     try std.testing.expectEqual(@as(usize, 0), clean_result.deleted_count);
     try std.testing.expectEqual(@as(usize, 1), clean_result.skipped_count);
@@ -264,14 +271,14 @@ test "end-to-end: scan -> dry_run -> force -> verify deleted + log" {
     writeTestContent(io, pkg);
     pkg.close(io);
 
-    var results = try scanner.scan(allocator, io, tmp, .{ .home = tmp });
+    const results = try scanner.scan(allocator, io, tmp, .{ .home = tmp });
 
     try std.testing.expect(results.items.len >= 1);
 
     var cfg = config_mod.Config.init(test_allocator);
     defer cfg.deinit();
 
-    const dry_result = clean(io, results.items, null, .dry_run, &cfg, null);
+    const dry_result = clean(io, results.items, null, .dry_run, &cfg, null, null);
     try std.testing.expect(dry_result.deleted_count >= 1);
 
     {
@@ -286,7 +293,7 @@ test "end-to-end: scan -> dry_run -> force -> verify deleted + log" {
     var log = logger_mod.Logger.init(io, tmp, test_allocator);
     defer log.deinit();
 
-    const force_result = clean(io, results.items, null, .force, &cfg, &log);
+    const force_result = clean(io, results.items, null, .force, &cfg, &log, null);
     try std.testing.expect(force_result.deleted_count >= 1);
 
     if (Dir.openDirAbsolute(io, tmp ++ "/project/target", .{})) |d| {

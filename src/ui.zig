@@ -10,50 +10,67 @@ const rules = @import("rules.zig");
 
 /// ANSI SGR escape sequences for text styling.
 /// Groups: basic (30-37), bright (90-97), 256-color (`38;5;N`).
-pub const Color = struct {
-    pub const reset = "\x1b[0m";
-    pub const bold = "\x1b[1m";
-    pub const dim = "\x1b[2m";
-    pub const italic = "\x1b[3m";
-    pub const underline = "\x1b[4m";
-    pub const red = "\x1b[31m";
-    pub const green = "\x1b[32m";
-    pub const yellow = "\x1b[33m";
-    pub const blue = "\x1b[34m";
-    pub const magenta = "\x1b[35m";
-    pub const cyan = "\x1b[36m";
-    pub const white = "\x1b[37m";
+pub const Palette = struct {
+    reset: []const u8 = "\x1b[0m",
+    bold: []const u8 = "\x1b[1m",
+    dim: []const u8 = "\x1b[2m",
+    italic: []const u8 = "\x1b[3m",
+    underline: []const u8 = "\x1b[4m",
+    red: []const u8 = "\x1b[31m",
+    green: []const u8 = "\x1b[32m",
+    yellow: []const u8 = "\x1b[33m",
+    blue: []const u8 = "\x1b[34m",
+    magenta: []const u8 = "\x1b[35m",
+    cyan: []const u8 = "\x1b[36m",
+    white: []const u8 = "\x1b[37m",
 
     // Bright variants (90-97)
-    pub const bright_red = "\x1b[91m";
-    pub const bright_green = "\x1b[92m";
-    pub const bright_yellow = "\x1b[93m";
-    pub const bright_blue = "\x1b[94m";
-    pub const bright_cyan = "\x1b[96m";
-    pub const bright_white = "\x1b[97m";
+    bright_red: []const u8 = "\x1b[91m",
+    bright_green: []const u8 = "\x1b[92m",
+    bright_yellow: []const u8 = "\x1b[93m",
+    bright_blue: []const u8 = "\x1b[94m",
+    bright_cyan: []const u8 = "\x1b[96m",
+    bright_white: []const u8 = "\x1b[97m",
 
     // 256-color: gradient bar colors
-    pub const fg_green_256 = "\x1b[38;5;34m"; // green
-    pub const fg_lime_256 = "\x1b[38;5;118m"; // lime/yellow-green
-    pub const fg_orange_256 = "\x1b[38;5;208m"; // orange
-    pub const fg_red_256 = "\x1b[38;5;196m"; // red
+    fg_green_256: []const u8 = "\x1b[38;5;34m", // green
+    fg_lime_256: []const u8 = "\x1b[38;5;118m", // lime/yellow-green
+    fg_orange_256: []const u8 = "\x1b[38;5;208m", // orange
+    fg_red_256: []const u8 = "\x1b[38;5;196m", // red
 
     // 256-color: grays
-    pub const fg_dark_gray = "\x1b[38;5;240m";
-    pub const fg_medium_gray = "\x1b[38;5;245m";
+    fg_dark_gray: []const u8 = "\x1b[38;5;240m",
+    fg_medium_gray: []const u8 = "\x1b[38;5;245m",
 
     // 256-color: category accents
-    pub const fg_teal = "\x1b[38;5;37m";
-    pub const fg_purple = "\x1b[38;5;135m";
-    pub const fg_sky = "\x1b[38;5;75m";
-    pub const fg_gold = "\x1b[38;5;220m";
-    pub const fg_coral = "\x1b[38;5;209m";
+    fg_teal: []const u8 = "\x1b[38;5;37m",
+    fg_purple: []const u8 = "\x1b[38;5;135m",
+    fg_sky: []const u8 = "\x1b[38;5;75m",
+    fg_gold: []const u8 = "\x1b[38;5;220m",
+    fg_coral: []const u8 = "\x1b[38;5;209m",
 
     // 256-color: rank medal colors
-    pub const fg_gold_medal = "\x1b[38;5;220m";
-    pub const fg_silver_medal = "\x1b[38;5;250m";
-    pub const fg_bronze_medal = "\x1b[38;5;173m";
+    fg_gold_medal: []const u8 = "\x1b[38;5;220m",
+    fg_silver_medal: []const u8 = "\x1b[38;5;250m",
+    fg_bronze_medal: []const u8 = "\x1b[38;5;173m",
 };
+
+/// Active palette. Field access keeps working at every call site
+/// (`ui.Color.red`); `initColors(false)` swaps every escape for "".
+pub var Color: Palette = .{};
+
+/// Disable colors when stdout is not a terminal or NO_COLOR is set.
+/// Call once at startup, before any thread is spawned.
+pub fn initColors(enabled: bool) void {
+    if (enabled) return;
+    Color = comptime blk: {
+        var p: Palette = .{};
+        for (@typeInfo(Palette).@"struct".fields) |f| {
+            @field(p, f.name) = "";
+        }
+        break :blk p;
+    };
+}
 
 /// Unicode box-drawing characters and block/symbol elements for TUI frames.
 pub const Box = struct {
@@ -212,6 +229,15 @@ pub fn truncateUtf8(s: []const u8, max_cols: usize) []const u8 {
     return s[0..i];
 }
 
+/// Returns the last `max` bytes of `path`, advanced to a UTF-8 codepoint
+/// boundary so the slice never starts mid-sequence.
+pub fn pathTail(path: []const u8, max: usize) []const u8 {
+    if (path.len <= max) return path;
+    var start = path.len - max;
+    while (start < path.len and (path[start] & 0xC0) == 0x80) start += 1;
+    return path[start..];
+}
+
 /// Prints a UTF-8 string `count` times.
 pub fn printRepeat(writer: anytype, str: []const u8, count: usize) !void {
     for (0..count) |_| {
@@ -233,6 +259,25 @@ pub fn formatSize(buf: []u8, bytes: u64) []const u8 {
         return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "???";
     }
     return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ size, units[unit_idx] }) catch "???";
+}
+
+/// Formats a byte count into a compact string for tight layouts:
+/// "713G", "1.0T", "560M". One decimal only below 10 units.
+pub fn formatSizeShort(buf: []u8, bytes: u64) []const u8 {
+    const units = [_]u8{ 'B', 'K', 'M', 'G', 'T' };
+    var size: f64 = @floatFromInt(bytes);
+    var unit_idx: usize = 0;
+    while (size >= 1024.0 and unit_idx < units.len - 1) {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+    if (unit_idx == 0) {
+        return std.fmt.bufPrint(buf, "{d}B", .{bytes}) catch "?";
+    }
+    if (size < 10.0) {
+        return std.fmt.bufPrint(buf, "{d:.1}{c}", .{ size, units[unit_idx] }) catch "?";
+    }
+    return std.fmt.bufPrint(buf, "{d:.0}{c}", .{ size, units[unit_idx] }) catch "?";
 }
 
 /// Returns short uptime like "14h" or "2d".
@@ -308,11 +353,10 @@ var progress_tick: usize = 0;
 /// count, and truncated current path. Overwrites the current line with `\r`
 /// and hides the cursor while active.
 pub fn printProgress(writer: anytype, count: usize, path: []const u8) !void {
-    const max_display: usize = 40;
-    const display = if (path.len > max_display) path[path.len - max_display ..] else path;
+    const display = pathTail(path, 40);
     const spin = Spinner.frame(progress_tick);
     progress_tick +%= 1;
-    try writer.print("\x1b[?25l\r{s}{s} Scanning...{s} {s}{d}{s} dirs checked {s}[{s}]{s}" ++ " " ** 10, .{
+    try writer.print("\x1b[?25l\r{s}{s} Scanning...{s} {s}{d}{s} dirs checked {s}[{s}]{s}\x1b[K", .{
         Color.cyan,
         spin,
         Color.reset,
@@ -329,44 +373,7 @@ pub fn printProgress(writer: anytype, count: usize, path: []const u8) !void {
 /// Clears the progress line, resets the spinner tick, and restores cursor visibility.
 pub fn clearProgress(writer: anytype) !void {
     progress_tick = 0;
-    try writer.print("\r" ++ " " ** 80 ++ "\r\x1b[?25h", .{});
-    try writer.flush();
-}
-
-/// Module-level tick counter for `printDeleteProgress`.
-var delete_tick: usize = 0;
-
-/// Prints a single-line deletion progress indicator with a braille spinner,
-/// item count, freed size, and truncated current path. Overwrites the current
-/// line with `\r` and hides the cursor while active.
-pub fn printDeleteProgress(writer: anytype, current: usize, total_items: usize, freed_size: u64, path: []const u8) !void {
-    var size_buf: [32]u8 = undefined;
-    const size_str = formatSize(&size_buf, freed_size);
-    const max_display: usize = 40;
-    const display = if (path.len > max_display) path[path.len - max_display ..] else path;
-    const spin = Spinner.frame(delete_tick);
-    delete_tick +%= 1;
-    try writer.print("\x1b[?25l\r{s}{s} Deleting...{s} {s}{d}/{d}{s} items ({s}{s}{s} freed) {s}[{s}]{s}" ++ " " ** 10, .{
-        Color.cyan,
-        spin,
-        Color.reset,
-        Color.bold,
-        current,
-        total_items,
-        Color.reset,
-        Color.bright_green,
-        size_str,
-        Color.reset,
-        Color.dim,
-        display,
-        Color.reset,
-    });
-}
-
-/// Clears the delete progress line, resets the tick counter, and restores cursor visibility.
-pub fn clearDeleteProgress(writer: anytype) !void {
-    delete_tick = 0;
-    try writer.print("\r" ++ " " ** 80 ++ "\r\x1b[?25h", .{});
+    try writer.print("\r\x1b[2K\x1b[?25h", .{});
     try writer.flush();
 }
 
