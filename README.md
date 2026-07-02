@@ -28,14 +28,30 @@ The binary is at `zig-out/bin/ev`.
 
 Completion scripts are in the `completions/` directory:
 
+**Bash**
+
 ```
-# Bash
+mkdir -p ~/.local/share/bash-completion/completions
 cp completions/ev.bash ~/.local/share/bash-completion/completions/ev
+```
 
-# Zsh
+**Zsh**
+
+```
+mkdir -p ~/.local/share/zsh/site-functions
 cp completions/ev.zsh ~/.local/share/zsh/site-functions/_ev
+```
 
-# Fish
+Make sure the directory is in your `fpath` before `compinit` runs (with Oh My Zsh, before `source $ZSH/oh-my-zsh.sh`). Add to `~/.zshrc`:
+
+```
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+```
+
+**Fish**
+
+```
+mkdir -p ~/.config/fish/completions
 cp completions/ev.fish ~/.config/fish/completions/ev.fish
 ```
 
