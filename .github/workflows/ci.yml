@@ -1,0 +1,44 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          cache-key: test
+
+      - name: Disable io_uring (workaround for Zig 0.16 hang)
+        run: sudo sysctl -w kernel.io_uring_disabled=2 || true
+
+      - run: zig build test
+        timeout-minutes: 10
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          cache-key: build
+
+      - name: Disable io_uring (workaround for Zig 0.16 hang)
+        run: sudo sysctl -w kernel.io_uring_disabled=2 || true
+
+      - run: zig build release
+        timeout-minutes: 10
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          use-cache: false
+
+      - run: zig fmt --check .

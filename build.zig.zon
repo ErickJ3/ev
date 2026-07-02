@@ -2,7 +2,7 @@
     .name = .evi,
     .version = "0.1.0",
     .fingerprint = 0xfc56d7553423f43a,
-    .minimum_zig_version = "0.16.0-dev.2637+6a9510c0e",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .clap = .{
             .url = "git+https://github.com/Hejsil/zig-clap#27621cb7207643f914bae7b01902b22a8b5916e7",
