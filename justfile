@@ -30,3 +30,9 @@ release-arm:
 
 release-freebsd:
     zig build -Dtarget=x86_64-freebsd -Doptimize=ReleaseSafe
+
+ci:
+    act push -W .github/workflows/ci.yml
+
+ci-release:
+    act workflow_dispatch -W .github/workflows/release.yml
