@@ -41,7 +41,7 @@ get_latest_version() {
         error "Neither curl nor wget found. Please install one of them."
     fi
 
-    [ -z "$LATEST_TAG" ] && error "Could not determine latest release. Check https://github.com/${REPO}/releases"
+    [ -n "$LATEST_TAG" ] || error "Could not determine latest release. Check https://github.com/${REPO}/releases"
 }
 
 download() {
